@@ -43,7 +43,7 @@ from utils.tools import (
 from utils.types import ChannelData, OriginType, CategoryChannelData
 
 channel_alias = Alias()
-invalid_channels = set()
+frozen_channels = set()
 
 
 def format_channel_data(url: str, origin: OriginType) -> ChannelData:
@@ -121,7 +121,6 @@ def get_channel_items() -> CategoryChannelData:
     local_data = get_name_urls_from_file(config.local_file, format_name_flag=True)
     whitelist = get_name_urls_from_file(constants.whitelist_path)
     whitelist_urls = get_urls_from_file(constants.whitelist_path)
-    blacklist = get_urls_from_file(constants.blacklist_path, pattern_search=False)
     whitelist_len = len(list(whitelist.keys()))
     if whitelist_len:
         print(f"Found {whitelist_len} channel in whitelist")
@@ -137,6 +136,7 @@ def get_channel_items() -> CategoryChannelData:
             try:
                 with gzip.open(constants.cache_path, "rb") as file:
                     old_result = pickle.load(file)
+                    max_delay = config.speed_test_timeout * 1000
                     min_resolution_value = config.min_resolution_value
                     for cate, data in channels.items():
                         if cate in old_result:
@@ -150,12 +150,12 @@ def get_channel_items() -> CategoryChannelData:
                                     for info in old_result[cate][name]:
                                         if info:
                                             try:
+                                                delay = info.get("delay", 0)
                                                 resolution = info.get("resolution")
-                                                if info.get("delay") == -1 or info.get("speed") < 0.1 or (
+                                                if (delay == -1 or delay > max_delay) or info.get("speed") == 0 or (
                                                         resolution and get_resolution_value(
-                                                    resolution) < min_resolution_value) or check_url_by_keywords(
-                                                    url, blacklist):
-                                                    invalid_channels.add(info["url"])
+                                                    resolution) < min_resolution_value):
+                                                    frozen_channels.add(info["url"])
                                                     continue
                                                 if info["origin"] == "whitelist" and not any(
                                                         url in info["url"] for url in whitelist_urls):
@@ -163,6 +163,10 @@ def get_channel_items() -> CategoryChannelData:
                                             except:
                                                 pass
                                             if info["url"] not in urls:
+                                                channels[cate][name].append(info)
+                                    if not channels[cate][name]:
+                                        for info in old_result[cate][name]:
+                                            if info and info["url"] not in urls:
                                                 channels[cate][name].append(info)
             except Exception as e:
                 print(f"Error loading cache file: {e}")
@@ -524,7 +528,7 @@ def append_data_to_info_data(
 
             if not url_origin or not url:
                 continue
-            if url in invalid_channels or (url in existing_urls and (url_origin != "whitelist" and not headers)):
+            if url in frozen_channels or (url in existing_urls and (url_origin != "whitelist" and not headers)):
                 continue
 
             if not ipv_type:
@@ -652,6 +656,9 @@ def append_total_data(
     whitelist = get_urls_from_file(constants.whitelist_path)
     blacklist = get_urls_from_file(constants.blacklist_path, pattern_search=False)
     url_hosts_ipv_type = {}
+    open_history = config.open_history
+    open_local = config.open_local
+    open_rtmp = config.open_rtmp
     for obj in data.values():
         for value_list in obj.values():
             for value in value_list:
@@ -660,7 +667,7 @@ def append_total_data(
     for cate, channel_obj in items:
         for name, old_info_list in channel_obj.items():
             print(f"{name}:", end=" ")
-            if old_info_list and (config.open_history or config.open_local or config.open_rtmp):
+            if (open_history or open_local or open_rtmp) and old_info_list:
                 append_old_data_to_info_data(data, cate, name, old_info_list, whitelist=whitelist, blacklist=blacklist,
                                              ipv_type_data=url_hosts_ipv_type)
             for method, result in total_result:
@@ -730,31 +737,26 @@ def sort_channel_result(channel_data, result, filter_host=False, ipv6_support=Tr
     Sort channel result
     """
     channel_result = defaultdict(lambda: defaultdict(list))
-    logger = get_logger(constants.sort_log_path, level=INFO, init=True)
+    logger = get_logger(constants.speed_test_log_path, level=INFO, init=True)
     for cate, obj in channel_data.items():
         for name, values in obj.items():
             if not values:
                 continue
-            if filter_host:
-                name_results = [
-                    {**value, **get_speed_result(value["host"])}
-                    for value in values
-                ]
-            else:
-                name_results = (
-                        [
-                            value for value in values
-                            if value["origin"] in ["whitelist", "live", "hls"] or
-                               (not ipv6_support and value["ipv_type"] == "ipv6")
-                        ]
-                        + result[cate][name]
-                )
-            sort_result = get_sort_result(name_results, name=name, ipv6_support=ipv6_support, logger=logger)
+            whitelist_result = []
+            test_result = [] if filter_host else result.get(cate, {}).get(name, [])
+            for value in values:
+                if value["origin"] in ["whitelist", "live", "hls"] or (
+                        not ipv6_support and value["ipv_type"] == "ipv6"):
+                    whitelist_result.append(value)
+                elif filter_host:
+                    test_result.append({**value, **get_speed_result(value["host"])})
+            total_result = whitelist_result + get_sort_result(test_result, name=name, ipv6_support=ipv6_support,
+                                                              logger=logger)
             append_data_to_info_data(
                 channel_result,
                 cate,
                 name,
-                sort_result,
+                total_result,
                 check=False,
             )
     logger.handlers.clear()
